@@ -1,0 +1,25 @@
+# Python bytecode
+*.pyc
+
+# Logs
+*.log
+*.csv
+*.out
+
+# Virtualenv
+venv/
+
+# Build
+build/
+dist/
+__pycache__/
+
+# IDE
+.vscode/
+.idea/
+
+# data
+data/*
+
+# exp
+ablation/*

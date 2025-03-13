@@ -5,6 +5,7 @@ from utils.loggers import *
 from utils.loggers import CsvLogger
 from argparse import Namespace
 from models.utils.continual_model import ContinualModel
+from models.onlinevt import Onlinevt
 from mydatasets.utils.continual_dataset import ContinualDataset
 from typing import Tuple
 from mydatasets import get_dataset
@@ -109,7 +110,7 @@ def evaluate(model: ContinualModel, dataset: ContinualDataset, task_id, last=Fal
     return accs, accs_mask_classes
 
 
-def train(model: ContinualModel, dataset: ContinualDataset,
+def train(model: Onlinevt, dataset: ContinualDataset,
           args: Namespace) -> None:
     """
     The training process, including evaluations and loggers.
@@ -168,6 +169,44 @@ def train(model: ContinualModel, dataset: ContinualDataset,
                 if args.use_inf:
                     model.buffer.find_low_decrease_inf(examples=not_aug_inputs, model=model.net.net,\
                             k = t, dataset = dataset, labels=labels)
+                if args.find_in_step and args.use_perturbation:
+                    if args.use_ema:
+                        model.buffer.find_low_grad_trace_gaussian_perturbation_ema(inputs=inputs, not_aug_inputs=not_aug_inputs, labels=labels, model=model.net.net)
+                    else:
+                        model.buffer.find_low_grad_trace_gaussian_perturbation(inputs=inputs, not_aug_inputs=not_aug_inputs, labels=labels, model=model.net.net)
+                    model.buffer.add_low_trace(n_tasks)
+                elif args.find_in_step and args.use_attack:
+                    if args.use_l2:
+                        eps = math.sqrt(3*32*32*math.pow((args.eps/255),2))
+                        alpha = math.sqrt(3*32*32*math.pow((args.alpha_atk/255),2))
+                        l2 = True
+                    else:
+                        eps = (args.eps/255)
+                        alpha = (args.alpha_atk/255)
+                        l2 = False
+                    if args.buffer_attack == 'PGD':
+                        attack = PGD(model.net.net, eps=eps, alpha=alpha, steps=args.steps, targeted=True, normalize=False,l2=l2)
+                    elif args.buffer_attack == 'MIFGSM':
+                        attack = MIFGSM(model.net.net, eps=eps, alpha=alpha, steps=args.steps, targeted=True, normalize=False,l2=l2)
+                    elif args.buffer_attack == 'NIFGSM':
+                        attack = NIFGSM(model.net.net, eps=eps, alpha=alpha, steps=args.steps, targeted=True, normalize=False,l2=l2)
+
+                    if args.num_good is not None: #! add low and high loss imgs
+                        adv_aug_inputs = attack(inputs, labels)
+                        model.buffer.find_low_high_decrease(examples=not_aug_inputs, adv_aug_inputs=adv_aug_inputs,\
+                                                        model=model.net.net, labels=labels)
+                        model.buffer.add_low_high_decrease(n_tasks,args.add_adv,task=t,\
+                                                        percent=args.num_good,folder=args.out_dir)
+                    else: #! add low loss decrease imgs
+                        adv_aug_inputs = attack(inputs, labels)
+                        if args.use_ema:
+                            model.buffer.find_low_decrease_ema(examples=inputs, not_aug_inputs = not_aug_inputs, adv_aug_inputs=adv_aug_inputs,\
+                                                        model=model.net.net, labels=labels,lamda_grad_norm=args.lamda_grad_norm)
+                        else:
+                            model.buffer.find_low_decrease(examples=inputs, not_aug_inputs = not_aug_inputs, adv_aug_inputs=adv_aug_inputs,\
+                                                        model=model.net.net, labels=labels,lamda_grad_norm=args.lamda_grad_norm)
+                        model.buffer.add_low_decrease(n_tasks,args.add_adv,task=t,folder=args.out_dir,save_img=args.save_img,transform_img=inputs)
+                    
                 # progress_bar(i, len(train_loader), epoch, t, loss)
 
                 if hasattr(model, 'middle_task') and (i % 2000) == 0 and i > 0 and dataset.NAME == 'seq-mnist':
@@ -202,9 +241,9 @@ def train(model: ContinualModel, dataset: ContinualDataset,
 
         mean_acc = np.mean(accs, axis=1)
         print_mean_accuracy(mean_acc, t + 1, dataset.SETTING)
-        
 
-        if args.use_attack and t < dataset.N_TASKS-1: #! attack method
+
+        if args.use_attack and t < dataset.N_TASKS-1 and not args.find_in_step: #! attack method
             if args.use_l2:
                 eps = math.sqrt(3*32*32*math.pow((args.eps/255),2))
                 alpha = math.sqrt(3*32*32*math.pow((args.alpha_atk/255),2))
@@ -240,11 +279,17 @@ def train(model: ContinualModel, dataset: ContinualDataset,
                                                     model=model.net.net, labels=labels,lamda_grad_norm=args.lamda_grad_norm)
                 model.buffer.add_low_decrease(n_tasks,args.add_adv,task=t,folder=args.out_dir,save_img=args.save_img,transform_img=inputs)
                 
-        elif args.use_perturbation and t < dataset.N_TASKS-1:
+        elif args.use_perturbation and t < dataset.N_TASKS-1 and not args.find_in_step:
             for data in train_loader:
                 inputs, labels, not_aug_inputs = data
-                model.buffer.find_low_grad_trace_gaussian_perturbation(inputs=inputs, not_aug_inputs=not_aug_inputs, labels=labels, model=model.net.net)
+                if args.use_ema:
+                    model.buffer.find_low_grad_trace_gaussian_perturbation_ema(inputs=inputs, not_aug_inputs=not_aug_inputs, labels=labels, model=model.net.net)
+                else:
+                    model.buffer.find_low_grad_trace_gaussian_perturbation(inputs=inputs, not_aug_inputs=not_aug_inputs, labels=labels, model=model.net.net)
             model.buffer.add_low_trace(n_tasks)
+            
+        else:
+            pass
         
         model_stash['mean_accs'].append(mean_acc)
 

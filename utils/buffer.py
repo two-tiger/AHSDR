@@ -150,6 +150,7 @@ class Buffer:
         self.class_decreased_loss = {}
         self.class_decreased_loss_ema = {}
         self.class_low_trace = {}
+        self.class_low_trace_ema = {}
         self.class_images = {}
         self.class_adv_images = {}
         self.class_decreased_most_loss = {}
@@ -160,6 +161,7 @@ class Buffer:
             self.class_decreased_loss[str(i)] = []
             self.class_decreased_loss_ema[str(i)] = 0
             self.class_low_trace[str(i)] = []
+            self.class_low_trace_ema[str(i)] = 0
         # 初始化每类的原图片
         for i in range(self.num_classes):
             self.class_images[str(i)] = []
@@ -593,6 +595,23 @@ class Buffer:
         # 计算协方差矩阵的迹
         trace_cov = torch.einsum("bii->b", cov_matrix)
         
+        # for i in range(inputs.shape[0]):
+        #     label_int = int(labels[i].item())
+        #     if label_int not in self.current_task_labels:
+        #         self.current_task_labels.append(label_int)
+        #     label = str(labels[i].item())
+        #     #! 不到每类的最大个数，就直接把迹和图片加进list中
+        #     if len(self.class_low_trace[label]) < max_class_buffer_size:
+        #         self.class_low_trace[label].append(trace_cov[i].item())
+        #         self.class_images[label].append(not_aug_inputs[i])
+        #     #! 达到每类最大个数后，则进行判断
+        #     else:
+        #         #! 若当前的迹小于list中的最大值，则将当前图片和迹替换进list
+        #         if trace_cov[i].item() < max(self.class_low_trace[label]):
+        #             idx = self.class_low_trace[label].index(max(self.class_low_trace[label]))
+        #             self.class_low_trace[label][idx] = trace_cov[i].item()
+        #             self.class_images[label][idx] = not_aug_inputs[i]
+                    
         for i in range(inputs.shape[0]):
             label_int = int(labels[i].item())
             if label_int not in self.current_task_labels:
@@ -605,9 +624,55 @@ class Buffer:
             #! 达到每类最大个数后，则进行判断
             else:
                 #! 若当前的迹小于list中的最大值，则将当前图片和迹替换进list
-                if trace_cov[i].item() < max(self.class_low_trace[label]):
-                    idx = self.class_low_trace[label].index(max(self.class_low_trace[label]))
+                if trace_cov[i].item() > min(self.class_low_trace[label]):
+                    idx = self.class_low_trace[label].index(min(self.class_low_trace[label]))
                     self.class_low_trace[label][idx] = trace_cov[i].item()
+                    self.class_images[label][idx] = not_aug_inputs[i]
+                    
+    def find_low_grad_trace_gaussian_perturbation_ema(self, inputs, not_aug_inputs, labels, model):
+        max_class_buffer_size = self.buffer_size // self.num_classes
+        grad_list = []
+        labels = labels.to(self.device)
+        # 生成3个高斯扰动样本
+        for _ in range(3):
+            cri = nn.CrossEntropyLoss(reduction='none')
+            noise = torch.rand_like(inputs) * 0.1
+            perturbed_inputs = inputs + noise
+            perturbed_inputs = perturbed_inputs.to(self.device)
+            perturbed_inputs.requires_grad = True
+            logit = model(perturbed_inputs)
+            loss = cri(logit, labels)
+            grads = grad(loss, perturbed_inputs, grad_outputs=torch.ones_like(loss), create_graph=True)[0].view(inputs.shape[0], -1)
+            grad_list.append(grads)
+            
+        # 将梯度堆叠为 (3, batch_size, num_features)
+        grad_matrix = torch.stack(grad_list)
+        
+        # 计算梯度协方差矩阵
+        mean_grad = torch.mean(grad_matrix, dim=0, keepdim=True)
+        centered_grads = grad_matrix - mean_grad
+        cov_matrix = torch.matmul(centered_grads.permute(1, 2, 0), centered_grads.permute(1, 0, 2)) / (grad_matrix.shape[0] - 1)
+        
+        # 计算协方差矩阵的迹
+        trace_cov = torch.einsum("bii->b", cov_matrix)
+        
+        for i in range(inputs.shape[0]):
+            label_int = int(labels[i].item())
+            if label_int not in self.current_task_labels:
+                self.current_task_labels.append(label_int)
+            label = str(labels[i].item())
+            delta_trace = trace_cov[i] - self.class_low_trace_ema[label]
+            self.class_low_trace_ema[label] = 0.8 * self.class_low_trace_ema[label] + (1 - 0.8) * trace_cov[i].detach()
+            #! 不到每类的最大个数，就直接把迹和图片加进list中
+            if len(self.class_low_trace[label]) < max_class_buffer_size:
+                self.class_low_trace[label].append(delta_trace.item())
+                self.class_images[label].append(not_aug_inputs[i])
+            #! 达到每类最大个数后，则进行判断
+            else:
+                #! 若当前的迹小于list中的最大值，则将当前图片和迹替换进list
+                if delta_trace.item() < max(self.class_low_trace[label]):
+                    idx = self.class_low_trace[label].index(max(self.class_low_trace[label]))
+                    self.class_low_trace[label][idx] = delta_trace.item()
                     self.class_images[label][idx] = not_aug_inputs[i]
                     
     def add_low_trace(self, n_tasks):
@@ -619,7 +684,8 @@ class Buffer:
             label_int = self.current_task_labels[i]
             label = str(label_int)
 
-            for j in range(label_int * max_class_buffer_size, (label_int+1) * max_class_buffer_size):
+            class_buffer_num = min(max_class_buffer_size, len(self.class_images[label]))
+            for j in range(label_int * max_class_buffer_size, label_int * max_class_buffer_size + class_buffer_num):
                 self.examples[j] = self.class_images[label][j % max_class_buffer_size]
                 self.labels[j] = torch.tensor(label_int).to(self.device)
         #! 一个task结束后清空缓存器

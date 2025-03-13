@@ -7,4 +7,4 @@
 #SBATCH --gres=gpu:nvidia_rtx_a6000:1 # 申请GPU
 #SBATCH -w gpu07      # 指定运⾏作业的节点是 gpu06，若不填写则不指定
 
-python  utils/main.py --model onlinevt --load_best_args --dataset seq-cifar10 --buffer_size 50 --csv_log --num_classes 10 --num_workers 12 --seed 42 --use_attack --buffer_attack MIFGSM --use_l2 --use_ema --out_dir  ablation/cifar10/l2 >>  inner_step_use_ema_attack.log 2>&1
+python  utils/main.py --model onlinevt --load_best_args --dataset seq-cifar10 --buffer_size 50 --csv_log --num_classes 10 --num_workers 12 --seed 42 --use_perturbation --use_ema --find_in_step >>  inner_step_perturbation_ema.log 2>&1

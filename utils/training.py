@@ -120,6 +120,9 @@ def train(model: Onlinevt, dataset: ContinualDataset,
     """
     model_stash = create_stash(model, args, dataset)
     results, results_mask_classes = [], []
+    class_num_seen_img = {}
+    for i in range(args.num_classes):
+        class_num_seen_img[str(i)] = 0
 
     if args.csv_log:
         csv_logger = CsvLogger(dataset.SETTING, dataset.NAME, model.NAME, dataset.N_TASKS)
@@ -169,11 +172,13 @@ def train(model: Onlinevt, dataset: ContinualDataset,
                 if args.use_inf:
                     model.buffer.find_low_decrease_inf(examples=not_aug_inputs, model=model.net.net,\
                             k = t, dataset = dataset, labels=labels)
+                for label in labels:
+                    class_num_seen_img[str(label.item())] += 1
                 if args.find_in_step and args.use_perturbation:
                     if args.use_ema:
-                        model.buffer.find_low_grad_trace_gaussian_perturbation_ema(inputs=inputs, not_aug_inputs=not_aug_inputs, labels=labels, model=model.net.net)
+                        model.buffer.find_low_grad_trace_gaussian_perturbation_ema(inputs=inputs, not_aug_inputs=not_aug_inputs, labels=labels, model=model.net.net, class_num_seen_img=class_num_seen_img)
                     else:
-                        model.buffer.find_low_grad_trace_gaussian_perturbation(inputs=inputs, not_aug_inputs=not_aug_inputs, labels=labels, model=model.net.net)
+                        model.buffer.find_low_grad_trace_gaussian_perturbation(inputs=inputs, not_aug_inputs=not_aug_inputs, labels=labels, model=model.net.net,class_num_seen_img=class_num_seen_img)
                     model.buffer.add_low_trace(n_tasks)
                 elif args.find_in_step and args.use_attack:
                     if args.use_l2:
@@ -184,12 +189,10 @@ def train(model: Onlinevt, dataset: ContinualDataset,
                         eps = (args.eps/255)
                         alpha = (args.alpha_atk/255)
                         l2 = False
-                    if args.buffer_attack == 'PGD':
-                        attack = PGD(model.net.net, eps=eps, alpha=alpha, steps=args.steps, targeted=True, normalize=False,l2=l2)
-                    elif args.buffer_attack == 'MIFGSM':
-                        attack = MIFGSM(model.net.net, eps=eps, alpha=alpha, steps=args.steps, targeted=True, normalize=False,l2=l2)
-                    elif args.buffer_attack == 'NIFGSM':
-                        attack = NIFGSM(model.net.net, eps=eps, alpha=alpha, steps=args.steps, targeted=True, normalize=False,l2=l2)
+                        
+                    from typing import Union
+                    buffer_attack_kwargs = dict(eps=eps, alpha=alpha, steps=args.steps, targeted=True, normalize=False,l2=l2)
+                    attack:Union[PGD,MIFGSM,NIFGSM] = eval(args.buffer_attack)(model.net.net,**buffer_attack_kwargs)
 
                     if args.num_good is not None: #! add low and high loss imgs
                         adv_aug_inputs = attack(inputs, labels)

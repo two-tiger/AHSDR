@@ -55,6 +55,7 @@ def main():
     parser.add_argument("--use_attack", action='store_true', help='use attack or not ')
     parser.add_argument("--use_ema", action='store_true', help='use ema or not ')
     parser.add_argument("--use_perturbation", action='store_true', help='use perturbation or not ')
+    parser.add_argument("--find_small", action='store_true', help='Take the smaller value of the indicator ')
     parser.add_argument("--find_in_step", action='store_true', help='find img in step ')
     parser.add_argument("--num_good", type=float, default=None,\
                         help="num of good imgs, if none, only store good.",)

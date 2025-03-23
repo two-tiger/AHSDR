@@ -14,6 +14,7 @@ from mydatasets import get_dataset
 from pytorch_metric_learning import losses as torch_losses
 from losses.SupConLoss import SupConLoss
 from kornia.augmentation import RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomGrayscale
+from torch.autograd import grad
 
 def get_parameter_number(net):
     trainable_num = sum(p.numel() for p in net.parameters() if p.requires_grad)
@@ -60,6 +61,7 @@ class Onlinevt(ContinualModel):
         self.MSloss = torch_losses.MultiSimilarityLoss(alpha=2, beta=10, base=0.5)
         self.ce_loss = torch.nn.CrossEntropyLoss().to(self.device)
         self.sc_loss = SupConLoss(temperature=self.temperature)
+        self.args = args
 
     def observe(self, inputs, labels, not_aug_inputs,task_id, with_der=False):
         self.opt.zero_grad()
@@ -67,13 +69,44 @@ class Onlinevt(ContinualModel):
             self.register_buffer('classes_so_far', labels.unique().to('cpu'))
         else:
             self.register_buffer('classes_so_far', torch.cat((self.classes_so_far, labels.to('cpu'))).unique())
-
-        loss = self.get_loss_res18(inputs, labels, not_aug_inputs, task_id, with_der)
+        if self.args.use_grad_diff:
+            inputs.requires_grad = True
+            loss = self.get_loss_res18(inputs, labels, not_aug_inputs, task_id, with_der)
+            org_grad = grad(loss, inputs, grad_outputs=torch.ones_like(loss), create_graph=True)[0].view(inputs.shape[0], -1)
+            org_grad_norm = F.normalize(org_grad, p=2, dim=1)
+            inputs.grad = None
+        elif self.args.use_perturbation_diff:
+            org_grad_list = []
+            for _ in range(3):
+                noise = torch.rand_like(inputs) * 0.1
+                perturbation_inputs = inputs + noise
+                perturbation_inputs = perturbation_inputs.to(self.device)
+                perturbation_inputs.requires_grad = True
+                perturbation_loss = self.get_loss_res18(perturbation_inputs, labels, not_aug_inputs, task_id, with_der)
+                perturbation_grads = grad(perturbation_loss, perturbation_inputs, grad_outputs=torch.ones_like(perturbation_loss), create_graph=True)[0].view(inputs.shape[0], -1)
+                org_grad_list.append(perturbation_grads)
+                
+            grad_matrix = torch.stack(org_grad_list)
+            mean_grad = torch.mean(grad_matrix, dim=0, keepdim=True)
+            centered_grads = grad_matrix - mean_grad
+            cov_matrix = torch.matmul(centered_grads.permute(1, 2, 0), centered_grads.permute(1, 0, 2)) / (grad_matrix.shape[0] - 1)
+            
+            # 计算协方差矩阵的迹
+            org_trace_cov = torch.einsum("bii->b", cov_matrix)
+            loss = self.get_loss_res18(inputs, labels, not_aug_inputs, task_id, with_der)
+        else:
+            loss = self.get_loss_res18(inputs, labels, not_aug_inputs, task_id, with_der)
+            
         loss.backward()
-
+        
         self.opt.step()
-
-        return loss.item()
+        
+        if self.args.use_grad_diff:
+            return loss.item(), org_grad
+        elif self.args.use_perturbation_diff:
+            return loss.item(), org_trace_cov
+        else:
+            return loss.item()
 
     def ncm(self, x):
 
@@ -122,7 +155,7 @@ class Onlinevt(ContinualModel):
                 buf_inputs, buf_labels, _ = self.buffer.get_data(self.args.minibatch_size,self.transform,\
                                                             self.iter,self.print_freq,task_id)
             else: #! use random in original code
-                buf_inputs, buf_labels, buf_logits, _ = self.buffer.get_data(self.args.minibatch_size,self.transform,\
+                buf_inputs, buf_labels, _ = self.buffer.get_data(self.args.minibatch_size,self.transform,\
                                                             self.iter,self.print_freq,task_id)
             if self.iter % self.print_freq == 0:
                 print(f'buf_inputs:{buf_inputs.shape},buf_labels:{buf_labels.shape}\n')
@@ -145,7 +178,7 @@ class Onlinevt(ContinualModel):
             print('loss_sc: ', loss_sc)
             print('total loss: ', loss)
         self.iter += 1
-        if not self.args.use_attack and not self.args.use_inf: #! use random in original code
+        if not self.args.use_attack and not self.args.use_inf and not self.args.use_perturbation and not self.args.use_grad_diff and not self.args.use_perturbation_diff and not self.args.use_grad: #! use random in original code
             # print('no attack')
             if self.args.rand_balance_cls:
                 self.buffer.add_data_balanceclass(examples=not_aug_inputs,

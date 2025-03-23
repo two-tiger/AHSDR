@@ -57,6 +57,9 @@ def main():
     parser.add_argument("--use_perturbation", action='store_true', help='use perturbation or not ')
     parser.add_argument("--find_small", action='store_true', help='Take the smaller value of the indicator ')
     parser.add_argument("--find_in_step", action='store_true', help='find img in step ')
+    parser.add_argument("--use_grad_diff", action='store_true', help='use grad diff')
+    parser.add_argument("--use_perturbation_diff", action='store_true', help='use perturbation grad diff')
+    parser.add_argument("--use_grad", action='store_true', help='use grad ema')
     parser.add_argument("--num_good", type=float, default=None,\
                         help="num of good imgs, if none, only store good.",)
     parser.add_argument("--add_adv", action='store_true', help="add adv imgs or original imgs.",)

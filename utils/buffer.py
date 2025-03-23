@@ -152,6 +152,10 @@ class Buffer:
         self.class_decreased_loss_ema = {}
         self.class_low_trace = {}
         self.class_low_trace_ema = {}
+        self.class_grad_diff = {}
+        self.class_trace_diff = {}
+        self.class_grad_ema = {}
+        self.class_delta_grad_ema = {}
         self.class_images = {}
         self.class_adv_images = {}
         self.class_decreased_most_loss = {}
@@ -163,6 +167,10 @@ class Buffer:
             self.class_decreased_loss_ema[str(i)] = 0
             self.class_low_trace[str(i)] = []
             self.class_low_trace_ema[str(i)] = 0
+            self.class_grad_diff[str(i)] = []
+            self.class_trace_diff[str(i)] = []
+            self.class_grad_ema[str(i)] = None
+            self.class_delta_grad_ema[str(i)] = []
         # 初始化每类的原图片
         for i in range(self.num_classes):
             self.class_images[str(i)] = []
@@ -569,12 +577,10 @@ class Buffer:
                     self.class_images[label][idx] = not_aug_inputs[i]
                     self.class_adv_images[label][idx] = adv_aug_inputs[i]
                     
-    def find_low_grad_trace_gaussian_perturbation(self, inputs, not_aug_inputs, labels, model, class_num_seen_img):
-        max_class_buffer_size = self.buffer_size // self.num_classes
+    def generate_cov_trace(self, inputs, labels, model, num_disturb=3):
         grad_list = []
-        labels = labels.to(self.device)
         # 生成3个高斯扰动样本
-        for _ in range(3):
+        for _ in range(num_disturb):
             cri = nn.CrossEntropyLoss(reduction='none')
             noise = torch.rand_like(inputs) * 0.1
             perturbed_inputs = inputs + noise
@@ -595,23 +601,13 @@ class Buffer:
         
         # 计算协方差矩阵的迹
         trace_cov = torch.einsum("bii->b", cov_matrix)
+        return trace_cov
+                    
+    def find_low_grad_trace_gaussian_perturbation(self, inputs, not_aug_inputs, labels, model, class_num_seen_img=None):
+        max_class_buffer_size = self.buffer_size // self.num_classes
+        labels = labels.to(self.device)
         
-        # for i in range(inputs.shape[0]):
-        #     label_int = int(labels[i].item())
-        #     if label_int not in self.current_task_labels:
-        #         self.current_task_labels.append(label_int)
-        #     label = str(labels[i].item())
-        #     #! 不到每类的最大个数，就直接把迹和图片加进list中
-        #     if len(self.class_low_trace[label]) < max_class_buffer_size:
-        #         self.class_low_trace[label].append(trace_cov[i].item())
-        #         self.class_images[label].append(not_aug_inputs[i])
-        #     #! 达到每类最大个数后，则进行判断
-        #     else:
-        #         #! 若当前的迹小于list中的最大值，则将当前图片和迹替换进list
-        #         if trace_cov[i].item() < max(self.class_low_trace[label]):
-        #             idx = self.class_low_trace[label].index(max(self.class_low_trace[label]))
-        #             self.class_low_trace[label][idx] = trace_cov[i].item()
-        #             self.class_images[label][idx] = not_aug_inputs[i]
+        trace_cov = self.generate_cov_trace(inputs, labels, model)
                     
         for i in range(inputs.shape[0]):
             label_int = int(labels[i].item())
@@ -619,46 +615,40 @@ class Buffer:
                 self.current_task_labels.append(label_int)
             label = str(labels[i].item())
             #! 不到每类的最大个数，就直接把迹和图片加进list中
+            if class_num_seen_img is not None:
+                trace_cov_img = trace_cov[i].item() / math.sqrt(class_num_seen_img[label])
+            else:
+                trace_cov_img = trace_cov[i].item()
             if len(self.class_low_trace[label]) < max_class_buffer_size:
-                self.class_low_trace[label].append(trace_cov[i].item() / math.sqrt(class_num_seen_img[label]))
+                self.class_low_trace[label].append(trace_cov_img)
                 self.class_images[label].append(not_aug_inputs[i])
             #! 达到每类最大个数后，则进行判断
             else:
-                #! 若当前的迹小于list中的最大值，则将当前图片和迹替换进list
-                if trace_cov[i].item() / math.sqrt(class_num_seen_img[label]) < max(self.class_low_trace[label]):
-                    idx = self.class_low_trace[label].index(max(self.class_low_trace[label]))
-                    self.class_low_trace[label][idx] = trace_cov[i].item() / math.sqrt(class_num_seen_img[label])
-                    self.class_images[label][idx] = not_aug_inputs[i]
+                # 根据label在self.class_images里随机取出p%的图片，不足一张的按一张取出
+                num_samples = max(1, round(0.1 * len(self.class_images[label])))
+                rand_indices = np.random.choice(len(self.class_images[label]), num_samples, replace=False)
+                select_inputs = [self.class_images[label][k] for k in rand_indices]
+                select_inputs = torch.stack(select_inputs).to(self.device)
+                select_trace_cov = self.generate_cov_trace(select_inputs, torch.full((select_inputs.shape[0],), labels[i]).to(self.device), model)
+                
+                if self.args.find_small:
+                    #! 取小于当前迹的图片和迹替换进list
+                    for j, idx in enumerate(rand_indices):
+                        if trace_cov_img < select_trace_cov[j]:
+                            self.class_low_trace[label][idx] = trace_cov_img
+                            self.class_images[label][idx] = not_aug_inputs[i]
+                else:
+                    #! 取大于当前迹的图片和迹替换进list
+                    for j, idx in enumerate(rand_indices):
+                        if trace_cov_img > select_trace_cov[j]:
+                            self.class_low_trace[label][idx] = trace_cov_img
+                            self.class_images[label][idx] = not_aug_inputs[i]
                     
     def find_low_grad_trace_gaussian_perturbation_ema(self, inputs, not_aug_inputs, labels, model, class_num_seen_img):
         max_class_buffer_size = self.buffer_size // self.num_classes
-        grad_list = []
         labels = labels.to(self.device)
-        # 生成3个高斯扰动样本
-        for _ in range(3):
-            cri = nn.CrossEntropyLoss(reduction='none')
-            noise = torch.rand_like(inputs) * 0.1
-            perturbed_inputs = inputs + noise
-            perturbed_inputs = perturbed_inputs.to(self.device)
-            perturbed_inputs.requires_grad = True
-            logit = model(perturbed_inputs)
-            loss = cri(logit, labels)
-            # TODO 按照-1这个维度归一化一下，.normalize(dim=-1)
-            grads = grad(loss, perturbed_inputs, grad_outputs=torch.ones_like(loss), create_graph=True)[0].view(inputs.shape[0], -1)
-            grads_norm = F.normalize(grads, p=2, dim=-1)
-            grad_list.append(grads_norm)
-            
-        # 将梯度堆叠为 (3, batch_size, num_features)
-        grad_matrix = torch.stack(grad_list)
         
-        # 计算梯度协方差矩阵
-        mean_grad = torch.mean(grad_matrix, dim=0, keepdim=True)
-        centered_grads = grad_matrix - mean_grad
-        cov_matrix = torch.matmul(centered_grads.permute(1, 2, 0), centered_grads.permute(1, 0, 2)) / (grad_matrix.shape[0] - 1)
-        
-        # 计算协方差矩阵的迹x
-        # TODO 按类别记录，每类见过的图片，
-        trace_cov = torch.einsum("bii->b", cov_matrix)
+        trace_cov = self.generate_cov_trace(inputs, labels, model)
         
         for i in range(inputs.shape[0]):
             label_int = int(labels[i].item())
@@ -691,6 +681,141 @@ class Buffer:
                         self.class_images[label][idx] = not_aug_inputs[i]
                     
     def add_low_trace(self, n_tasks):
+        max_class_buffer_size = self.buffer_size // self.num_classes
+        #! 更新buffer_count
+        self.num_seen_examples += self.buffer_size // n_tasks
+        not_aug_inputs = []
+        for i in range(len(self.current_task_labels)):
+            label_int = self.current_task_labels[i]
+            label = str(label_int)
+
+            class_buffer_num = min(max_class_buffer_size, len(self.class_images[label]))
+            for j in range(label_int * max_class_buffer_size, label_int * max_class_buffer_size + class_buffer_num):
+                self.examples[j] = self.class_images[label][j % max_class_buffer_size]
+                self.labels[j] = torch.tensor(label_int).to(self.device)
+        #! 一个task结束后清空缓存器
+        self.current_task_labels = []
+        
+    def find_grad_ema(
+        self, inputs, not_aug_inputs, model, labels=None
+    ):
+
+        max_class_buffer_size = self.buffer_size // self.num_classes
+        if not hasattr(self, "examples"):
+            self.init_tensors(not_aug_inputs, labels,None,None,None)
+
+        #! 计算当前inputs的梯度
+        inputs_loss = grad_loss(model, inputs, labels, 0)
+        inputs_grad = grad(inputs_loss, inputs, grad_outputs=torch.ones_like(inputs_loss), create_graph=True)[0].view(inputs.shape[0], -1)
+        inputs_grad_norm = F.normalize(inputs_grad, p=2, dim=1)
+        
+        for i in range(inputs.shape[0]):
+            label_int = int(labels[i].item())
+            if label_int not in self.current_task_labels:
+                self.current_task_labels.append(label_int)
+            label = str(labels[i].item())
+            if self.class_grad_ema[label] is None:
+                self.class_grad_ema[label] = torch.zeros_like(inputs_grad_norm[i])
+            delta_grad_norm = torch.norm(inputs_grad_norm[i] - self.class_grad_ema[label], p=2, dim=-1)
+            self.class_grad_ema[label] = 0.2 * self.class_grad_ema[label] + (1 - 0.2) * inputs_grad_norm[i].detach()
+            #! 不到每类的最大个数，就直接把下降的loss和图片加进list中
+            if len(self.class_delta_grad_ema[label]) < max_class_buffer_size:
+                self.class_delta_grad_ema[label].append(delta_grad_norm.item())
+                self.class_images[label].append(not_aug_inputs[i])
+            #! 达到每类最大个数后，则进行判断
+            else:
+                if self.args.find_small:
+                    #! 若当前下降的损失小于list中的最大值，则将当前图片和损失替换进list
+                    if delta_grad_norm.item() < max(self.class_delta_grad_ema[label]):
+                        idx = self.class_delta_grad_ema[label].index(max(self.class_delta_grad_ema[label]))
+                        self.class_delta_grad_ema[label][idx] = delta_grad_norm.item()
+                        self.class_images[label][idx] = not_aug_inputs[i]
+                else:
+                    #! 若当前下降的损失大于list中的最小值，则将当前图片和损失替换进list
+                    if delta_grad_norm.item() < min(self.class_delta_grad_ema[label]):
+                        idx = self.class_delta_grad_ema[label].index(min(self.class_delta_grad_ema[label]))
+                        self.class_delta_grad_ema[label][idx] = delta_grad_norm.item()
+                        self.class_images[label][idx] = not_aug_inputs[i]
+        
+    def find_grad_diff(
+        self, inputs, not_aug_inputs, model, labels=None, org_grad=None
+    ):
+
+        max_class_buffer_size = self.buffer_size // self.num_classes
+        if not hasattr(self, "examples"):
+            self.init_tensors(not_aug_inputs, labels,None,None,None)
+
+        #! 计算当前inputs的梯度
+        inputs_loss = grad_loss(model, inputs, labels, 0)
+        inputs_grad = grad(inputs_loss, inputs, grad_outputs=torch.ones_like(inputs_loss), create_graph=True)[0].view(inputs.shape[0], -1)
+        inputs_grad_norm = F.normalize(inputs_grad, p=2, dim=1)
+        
+        grad_diff = inputs_grad_norm - org_grad
+        grad_diff_norm = torch.norm(grad_diff, p=2, dim=-1)
+        
+        for i in range(inputs.shape[0]):
+            label_int = int(labels[i].item())
+            if label_int not in self.current_task_labels:
+                self.current_task_labels.append(label_int)
+            label = str(labels[i].item())
+            #! 不到每类的最大个数，就直接把下降的loss和图片加进list中
+            if len(self.class_grad_diff[label]) < max_class_buffer_size:
+                self.class_grad_diff[label].append(grad_diff_norm[i].item())
+                self.class_images[label].append(not_aug_inputs[i])
+            #! 达到每类最大个数后，则进行判断
+            else:
+                if self.args.find_small:
+                    #! 若当前下降的损失小于list中的最大值，则将当前图片和损失替换进list
+                    if grad_diff_norm[i].item() < max(self.class_grad_diff[label]):
+                        idx = self.class_grad_diff[label].index(max(self.class_grad_diff[label]))
+                        self.class_grad_diff[label][idx] = grad_diff_norm[i].item()
+                        self.class_images[label][idx] = not_aug_inputs[i]
+                else:
+                    #! 若当前下降的损失大于list中的最小值，则将当前图片和损失替换进list
+                    if grad_diff_norm[i].item() < min(self.class_grad_diff[label]):
+                        idx = self.class_grad_diff[label].index(min(self.class_grad_diff[label]))
+                        self.class_grad_diff[label][idx] = grad_diff_norm[i].item()
+                        self.class_images[label][idx] = not_aug_inputs[i]
+                        
+    def find_perturbation_grad_diff(
+        self, inputs, not_aug_inputs, model, labels=None, org_trace=None
+    ):
+
+        max_class_buffer_size = self.buffer_size // self.num_classes
+        if not hasattr(self, "examples"):
+            self.init_tensors(not_aug_inputs, labels,None,None,None)
+
+        #! 计算当前inputs扰动后的trace
+        labels = labels.to(self.device)
+        trace_cov = self.generate_cov_trace(inputs, labels, model)
+        
+        trace_diff = torch.abs(trace_cov - org_trace)
+        
+        for i in range(inputs.shape[0]):
+            label_int = int(labels[i].item())
+            if label_int not in self.current_task_labels:
+                self.current_task_labels.append(label_int)
+            label = str(labels[i].item())
+            #! 不到每类的最大个数，就直接把下降的loss和图片加进list中
+            if len(self.class_trace_diff[label]) < max_class_buffer_size:
+                self.class_trace_diff[label].append(trace_diff[i].item())
+                self.class_images[label].append(not_aug_inputs[i])
+            #! 达到每类最大个数后，则进行判断
+            else:
+                if self.args.find_small:
+                    #! 若当前下降的损失小于list中的最大值，则将当前图片和损失替换进list
+                    if trace_diff[i].item() < max(self.class_trace_diff[label]):
+                        idx = self.class_trace_diff[label].index(max(self.class_trace_diff[label]))
+                        self.class_trace_diff[label][idx] = trace_diff[i].item()
+                        self.class_images[label][idx] = not_aug_inputs[i]
+                else:
+                    #! 若当前下降的损失大于list中的最小值，则将当前图片和损失替换进list
+                    if trace_diff[i].item() < min(self.class_trace_diff[label]):
+                        idx = self.class_trace_diff[label].index(min(self.class_trace_diff[label]))
+                        self.class_trace_diff[label][idx] = trace_diff[i].item()
+                        self.class_images[label][idx] = not_aug_inputs[i]
+                        
+    def add_for_diff(self, n_tasks):
         max_class_buffer_size = self.buffer_size // self.num_classes
         #! 更新buffer_count
         self.num_seen_examples += self.buffer_size // n_tasks

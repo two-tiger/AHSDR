@@ -162,12 +162,23 @@ def train(model: Onlinevt, dataset: ContinualDataset,
                     labels = labels.to(model.device, non_blocking=True)
                     not_aug_inputs = not_aug_inputs.to(model.device, non_blocking=True)
                     logits = logits.to(model.device, non_blocking=True)
-                    loss = model.observe(inputs, labels, not_aug_inputs, logits)
+                    if args.use_grad_diff:
+                        loss, org_grad = model.observe(inputs, labels, not_aug_inputs, logits)
+                    elif args.use_perturbation_diff:
+                        loss, org_trace = model.observe(inputs, labels, not_aug_inputs, logits)
+                    else:
+                        loss = model.observe(inputs, labels, not_aug_inputs, logits)
                 else:
                     inputs, labels, not_aug_inputs = data
                     inputs, labels = inputs.to(model.device, non_blocking=True), labels.to(
                         model.device, non_blocking=True)
                     not_aug_inputs = not_aug_inputs.to(model.device)
+                    if args.use_grad_diff:
+                        loss, org_grad = model.observe(inputs, labels, not_aug_inputs, task_id=t)
+                    elif args.use_perturbation_diff:
+                        loss, org_trace = model.observe(inputs, labels, not_aug_inputs, task_id=t)
+                    else:
+                        loss = model.observe(inputs, labels, not_aug_inputs, task_id=t)
                     loss = model.observe(inputs, labels, not_aug_inputs,task_id = t)
                 if args.use_inf:
                     model.buffer.find_low_decrease_inf(examples=not_aug_inputs, model=model.net.net,\
@@ -210,6 +221,17 @@ def train(model: Onlinevt, dataset: ContinualDataset,
                                                         model=model.net.net, labels=labels,lamda_grad_norm=args.lamda_grad_norm)
                         model.buffer.add_low_decrease(n_tasks,args.add_adv,task=t,folder=args.out_dir,save_img=args.save_img,transform_img=inputs)
                     
+                elif args.find_in_step and args.use_grad_diff:
+                    model.buffer.find_grad_diff(inputs=inputs, not_aug_inputs=not_aug_inputs, model=model.net.net, labels=labels, org_grad=org_grad)
+                    model.buffer.add_for_diff(n_tasks)
+                
+                elif args.find_in_step and args.use_perturbation_diff:
+                    model.buffer.find_perturbation_grad_diff(inputs=inputs, not_aug_inputs=not_aug_inputs, model=model.net.net, labels=labels, org_trace=org_trace)
+                    model.buffer.add_for_diff(n_tasks)
+                    
+                elif args.find_in_step and args.use_grad:
+                    model.buffer.find_grad_ema(inputs=inputs, not_aug_inputs=not_aug_inputs, model=model.net.net, labels=labels)
+                    model.buffer.add_for_diff(n_tasks)
                 # progress_bar(i, len(train_loader), epoch, t, loss)
 
                 if hasattr(model, 'middle_task') and (i % 2000) == 0 and i > 0 and dataset.NAME == 'seq-mnist':

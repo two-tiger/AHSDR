@@ -222,7 +222,7 @@ def train(model: Onlinevt, dataset: ContinualDataset,
                         model.buffer.add_low_decrease(n_tasks,args.add_adv,task=t,folder=args.out_dir,save_img=args.save_img,transform_img=inputs)
                     
                 elif args.find_in_step and args.use_grad_diff:
-                    model.buffer.find_grad_diff(inputs=inputs, not_aug_inputs=not_aug_inputs, model=model.net.net, labels=labels, org_grad=org_grad)
+                    model.buffer.find_grad_diff(inputs=inputs, not_aug_inputs=not_aug_inputs, model=model.net.net, labels=labels, org_grad=org_grad, step=i)
                     model.buffer.add_for_diff(n_tasks)
                 
                 elif args.find_in_step and args.use_perturbation_diff:

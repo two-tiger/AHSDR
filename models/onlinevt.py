@@ -73,7 +73,7 @@ class Onlinevt(ContinualModel):
             inputs.requires_grad = True
             loss = self.get_loss_res18(inputs, labels, not_aug_inputs, task_id, with_der)
             org_grad = grad(loss, inputs, grad_outputs=torch.ones_like(loss), create_graph=True)[0].view(inputs.shape[0], -1)
-            org_grad_norm = F.normalize(org_grad, p=2, dim=1)
+            # org_grad_norm = F.normalize(org_grad, p=2, dim=1)
             inputs.grad = None
         elif self.args.use_perturbation_diff:
             org_grad_list = []

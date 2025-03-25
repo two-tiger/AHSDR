@@ -12,6 +12,7 @@ import math
 from used_attacks import MIFGSM
 from torch.utils.data import DataLoader, TensorDataset
 from torch.autograd import grad
+from collections import defaultdict
 
 
 def compute_p_gradnorm(model, x, labels, k, dataset):
@@ -578,71 +579,137 @@ class Buffer:
                     self.class_adv_images[label][idx] = adv_aug_inputs[i]
                     
     def generate_cov_trace(self, inputs, labels, model, num_disturb=3):
-        grad_list = []
-        # 生成3个高斯扰动样本
-        for _ in range(num_disturb):
-            cri = nn.CrossEntropyLoss(reduction='none')
-            noise = torch.rand_like(inputs) * 0.1
-            perturbed_inputs = inputs + noise
-            perturbed_inputs = perturbed_inputs.to(self.device)
-            perturbed_inputs.requires_grad = True
-            logit = model(perturbed_inputs)
-            loss = cri(logit, labels)
-            grads = grad(loss, perturbed_inputs, grad_outputs=torch.ones_like(loss), create_graph=True)[0].view(inputs.shape[0], -1)
-            grad_list.append(grads)
-            
-        # 将梯度堆叠为 (3, batch_size, num_features)
-        grad_matrix = torch.stack(grad_list)
+        B = inputs.shape[0]
+        device = self.device
         
-        # 计算梯度协方差矩阵
-        mean_grad = torch.mean(grad_matrix, dim=0, keepdim=True)
-        centered_grads = grad_matrix - mean_grad
-        cov_matrix = torch.matmul(centered_grads.permute(1, 2, 0), centered_grads.permute(1, 0, 2)) / (grad_matrix.shape[0] - 1)
+        # 生成 num_disturb 个扰动样本，总数 D*B
+        expanded_inputs = inputs.repeat(num_disturb, 1, 1, 1) # [D * B, C, H, W]
+        noise = torch.rand_like(expanded_inputs) * 0.1
+        perturbed_inputs = expanded_inputs + noise
+        perturbed_inputs = perturbed_inputs.to(device)
+        perturbed_inputs.requires_grad = True
         
-        # 计算协方差矩阵的迹
-        trace_cov = torch.einsum("bii->b", cov_matrix)
+        # 扩展标签为 [D*B]
+        expanded_labels = labels.repeat(num_disturb).to(device)
+        
+        # 前向计算 loss
+        logits = model(perturbed_inputs)
+        cri = nn.CrossEntropyLoss(reduction='none')
+        loss = cri(logits, expanded_labels)
+        
+        # 计算梯度
+        grads = grad(loss, perturbed_inputs, grad_outputs=torch.ones_like(loss), create_graph=True, retain_graph=True, only_inputs=True)[0] # [D*B, C, H, W]
+        grads = grads.view(num_disturb, B, -1) # [D, B, F]
+        
+        # 计算每个样本的梯度协方差矩阵的 trace
+        mean_grad = grads.mean(dim=0, keepdim=True)
+        centered_grads = grads - mean_grad
+        cov = torch.einsum('dbf,dbk->bfk', centered_grads, centered_grads) / (num_disturb - 1)
+        # cov = torch.matmul(centered_grads.permute(1, 2, 0), centered_grads.permute(1, 0, 2)) / (num_disturb - 1)
+        trace_cov = cov.diagonal(dim1=1, dim2=2).sum(dim=1) # [B]
+        # trace_cov = torch.einsum("bii->b", cov)
+        
         return trace_cov
+        # grad_list = []
+        # # 生成3个高斯扰动样本
+        # for _ in range(num_disturb):
+        #     cri = nn.CrossEntropyLoss(reduction='none')
+        #     noise = torch.rand_like(inputs) * 0.1
+        #     perturbed_inputs = inputs + noise
+        #     perturbed_inputs = perturbed_inputs.to(self.device)
+        #     perturbed_inputs.requires_grad = True
+        #     logit = model(perturbed_inputs)
+        #     loss = cri(logit, labels)
+        #     grads = grad(loss, perturbed_inputs, grad_outputs=torch.ones_like(loss), create_graph=True)[0].view(inputs.shape[0], -1)
+        #     grad_list.append(grads)
+        #     perturbed_inputs.grad = None
+            
+        # # 将梯度堆叠为 (3, batch_size, num_features)
+        # grad_matrix = torch.stack(grad_list)
+        
+        # # 计算梯度协方差矩阵
+        # mean_grad = torch.mean(grad_matrix, dim=0, keepdim=True)
+        # centered_grads = grad_matrix - mean_grad
+        # cov_matrix = torch.matmul(centered_grads.permute(1, 2, 0), centered_grads.permute(1, 0, 2)) / (grad_matrix.shape[0] - 1)
+        
+        # # 计算协方差矩阵的迹
+        # trace_cov = torch.einsum("bii->b", cov_matrix)
+        # return trace_cov
                     
     def find_low_grad_trace_gaussian_perturbation(self, inputs, not_aug_inputs, labels, model, class_num_seen_img=None):
         max_class_buffer_size = self.buffer_size // self.num_classes
+        if not hasattr(self, "examples"):
+            self.init_tensors(not_aug_inputs, labels,None,None,None)
         labels = labels.to(self.device)
-        
+        # 计算inputs的trace
         trace_cov = self.generate_cov_trace(inputs, labels, model)
+        
+         # 构建(label -> [(img, trace)])映射
+        per_class_new_data = defaultdict(list)
+        for img, label, trace in zip(inputs, labels, trace_cov):
+            per_class_new_data[label.item()].append((img, trace.item()))
+            
+        # 对每个类进行更新
+        for cls, new_data in per_class_new_data.items():
+            # 不到每类的最大个数，就直接把迹和图片加进list中
+            if len(self.class_images[str(cls)]) + len(new_data) <= max_class_buffer_size:
+                self.class_low_trace[str(cls)] += [x[1] for x in new_data]
+                self.class_images[str(cls)] += [x[0] for x in new_data]
+            # 达到每个类最大个数后，则进行判断
+            else:
+                old_imgs = self.class_images[str(cls)]
+                if old_imgs:
+                    old_imgs_tensor = torch.stack(old_imgs)
+                    old_trace = self.generate_cov_trace(old_imgs_tensor, torch.full((old_imgs_tensor.shape[0],), cls).to(self.device), model)
                     
-        for i in range(inputs.shape[0]):
-            label_int = int(labels[i].item())
-            if label_int not in self.current_task_labels:
-                self.current_task_labels.append(label_int)
-            label = str(labels[i].item())
-            #! 不到每类的最大个数，就直接把迹和图片加进list中
-            if class_num_seen_img is not None:
-                trace_cov_img = trace_cov[i].item() / math.sqrt(class_num_seen_img[label])
-            else:
-                trace_cov_img = trace_cov[i].item()
-            if len(self.class_low_trace[label]) < max_class_buffer_size:
-                self.class_low_trace[label].append(trace_cov_img)
-                self.class_images[label].append(not_aug_inputs[i])
-            #! 达到每类最大个数后，则进行判断
-            else:
-                # 根据label在self.class_images里随机取出p%的图片，不足一张的按一张取出
-                num_samples = max(1, round(0.1 * len(self.class_images[label])))
-                rand_indices = np.random.choice(len(self.class_images[label]), num_samples, replace=False)
-                select_inputs = [self.class_images[label][k] for k in rand_indices]
-                select_inputs = torch.stack(select_inputs).to(self.device)
-                select_trace_cov = self.generate_cov_trace(select_inputs, torch.full((select_inputs.shape[0],), labels[i]).to(self.device), model)
-                
-                if self.args.find_small:
-                    #! 取小于当前迹的图片和迹替换进list
-                    for j, idx in enumerate(rand_indices):
-                        if trace_cov_img < select_trace_cov[j]:
-                            self.class_low_trace[label][idx] = trace_cov_img
-                            self.class_images[label][idx] = not_aug_inputs[i]
+                    # 合并新旧数据
+                    all_data = list(zip(old_imgs, old_trace.tolist())) + new_data # List of (img, trace)
                 else:
-                    #! 取大于当前迹的图片和迹替换进list
-                    for j, idx in enumerate(rand_indices):
-                        if trace_cov_img > select_trace_cov[j]:
-                            self.class_low_trace[label][idx] = trace_cov_img
-                            self.class_images[label][idx] = not_aug_inputs[i]
+                    all_data = new_data
+                
+                # 选出max_class_buffer_size个数据
+                if self.args.find_small:
+                    top_k = sorted(all_data, key=lambda x: x[1], reverse=False)[:max_class_buffer_size]
+                else:
+                    top_k = sorted(all_data, key=lambda x: x[1], reverse=True)[:max_class_buffer_size]
+                    
+                self.class_low_trace[str(cls)] = [x[1] for x in top_k]
+                self.class_images[str(cls)] = [x[0] for x in top_k]
+                    
+        # for i in range(inputs.shape[0]):
+        #     label_int = int(labels[i].item())
+        #     if label_int not in self.current_task_labels:
+        #         self.current_task_labels.append(label_int)
+        #     label = str(labels[i].item())
+        #     #! 不到每类的最大个数，就直接把迹和图片加进list中
+        #     if class_num_seen_img is not None:
+        #         trace_cov_img = trace_cov[i].item() / math.sqrt(class_num_seen_img[label])
+        #     else:
+        #         trace_cov_img = trace_cov[i].item()
+        #     if len(self.class_low_trace[label]) < max_class_buffer_size:
+        #         self.class_low_trace[label].append(trace_cov_img)
+        #         self.class_images[label].append(not_aug_inputs[i])
+        #     #! 达到每类最大个数后，则进行判断
+        #     else:
+        #         # 根据label在self.class_images里随机取出p%的图片，不足一张的按一张取出
+        #         num_samples = max(1, round(0.1 * len(self.class_images[label])))
+        #         rand_indices = np.random.choice(len(self.class_images[label]), num_samples, replace=False)
+        #         select_inputs = [self.class_images[label][k] for k in rand_indices]
+        #         select_inputs = torch.stack(select_inputs).to(self.device)
+        #         select_trace_cov = self.generate_cov_trace(select_inputs, torch.full((select_inputs.shape[0],), labels[i]).to(self.device), model)
+                
+        #         if self.args.find_small:
+        #             #! 取小于当前迹的图片和迹替换进list
+        #             for j, idx in enumerate(rand_indices):
+        #                 if trace_cov_img < select_trace_cov[j]:
+        #                     self.class_low_trace[label][idx] = trace_cov_img
+        #                     self.class_images[label][idx] = not_aug_inputs[i]
+        #         else:
+        #             #! 取大于当前迹的图片和迹替换进list
+        #             for j, idx in enumerate(rand_indices):
+        #                 if trace_cov_img > select_trace_cov[j]:
+        #                     self.class_low_trace[label][idx] = trace_cov_img
+        #                     self.class_images[label][idx] = not_aug_inputs[i]
                     
     def find_low_grad_trace_gaussian_perturbation_ema(self, inputs, not_aug_inputs, labels, model, class_num_seen_img):
         max_class_buffer_size = self.buffer_size // self.num_classes
@@ -738,7 +805,7 @@ class Buffer:
                         self.class_images[label][idx] = not_aug_inputs[i]
         
     def find_grad_diff(
-        self, inputs, not_aug_inputs, model, labels=None, org_grad=None
+        self, inputs, not_aug_inputs, model, labels=None, org_grad=None, step=None
     ):
 
         max_class_buffer_size = self.buffer_size // self.num_classes
@@ -748,9 +815,9 @@ class Buffer:
         #! 计算当前inputs的梯度
         inputs_loss = grad_loss(model, inputs, labels, 0)
         inputs_grad = grad(inputs_loss, inputs, grad_outputs=torch.ones_like(inputs_loss), create_graph=True)[0].view(inputs.shape[0], -1)
-        inputs_grad_norm = F.normalize(inputs_grad, p=2, dim=1)
+        # inputs_grad_norm = F.normalize(inputs_grad, p=2, dim=1)
         
-        grad_diff = inputs_grad_norm - org_grad
+        grad_diff = (inputs_grad - org_grad) * math.sqrt(step + 1)
         grad_diff_norm = torch.norm(grad_diff, p=2, dim=-1)
         
         for i in range(inputs.shape[0]):
